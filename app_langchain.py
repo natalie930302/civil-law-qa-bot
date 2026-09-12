@@ -78,6 +78,14 @@ class Config:
     # 實際發送給使用者的法規來源段落數量
     REFERENCES_TO_SEND = 3
 
+    # === 信心閾值(2026/09新增)===
+    # 用 eval/calibrate_bot_confidence.py 對24題真實問題(跟這個Chroma DB同一批
+    # 4部法規PDF)+ 6題明顯無關的問題,實測Chroma similarity_search_with_score()
+    # 回傳的L2距離分布校準出來的:in-domain最大距離1.1193,out-of-domain最小
+    # 距離1.2235,取中點1.1714。距離越小越相關,所以「小於此值才算confident」。
+    # 見 eval/bot_threshold_tuning_results.json 完整數字。
+    CONFIDENCE_DISTANCE_THRESHOLD = 1.1714
+
 # ===================================================================
 # LangChain 核心元件初始化
 # ===================================================================
@@ -430,15 +438,44 @@ def handle_message(event):
     # === 5. 核心查詢處理邏輯 ===
     try:
         if qa_chain and vectorstore:
+            # === 5a. 信心把關(2026/09新增)===
+            # 檢索前先量測最相關文件的距離,距離太大代表這批法規裡可能根本
+            # 沒有跟問題相關的內容,誠實回報而不是硬答(避免GPT根據不相關的
+            # 內容瞎編一個看似合理的答案)
+            top1_distance = None
+            try:
+                top1 = vectorstore.similarity_search_with_score(user_query, k=1)
+                if top1:
+                    top1_distance = top1[0][1]
+            except Exception as e:
+                logging.warning(f"信心把關查詢失敗,略過此步驟直接回答: {e}")
+
+            if top1_distance is not None and top1_distance > Config.CONFIDENCE_DISTANCE_THRESHOLD:
+                logging.info(f"信心不足(距離={top1_distance:.4f} > 閾值{Config.CONFIDENCE_DISTANCE_THRESHOLD}),誠實拒答")
+                try:
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text=(
+                                "目前這4部法規(公務人員考績法、考績法施行細則、"
+                                "公務員懲戒法、公務員服務法)裡沒有找到足夠可信的相關內容，"
+                                "建議換個問法，或確認問題是否屬於這幾部法規的範圍。"
+                            ))]
+                        )
+                    )
+                except Exception as reply_error:
+                    logging.error(f"回覆拒答訊息失敗: {reply_error}")
+                return
+
             # === 使用LangChain完整問答系統 ===
             # 呼叫問答鏈，整合檢索、GPT回答與來源文件
             result = qa_chain.invoke({"query": user_query})
-            
+
             # 提取GPT生成的回答文字
             llm_answer = result.get('result', "抱歉，我無法處理您的請求。").strip()
             # 提取檢索到的相關法規文件
             source_documents = result.get('source_documents', [])
-            
+
             # === 備用檢索機制 ===
             # 如果QA鏈沒有找到相關文件，嘗試直接搜尋向量資料庫
             if not source_documents or len(source_documents) == 0:

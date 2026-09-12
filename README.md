@@ -5,9 +5,12 @@
 ## 運作流程
 
 1. 透過 LINE Bot 接收使用者問題
-2. 用 LangChain 在向量資料庫(`chroma_db_langchain`)中檢索相關法規內容
-3. 透過 OpenAI GPT 產生法規說明回答
-4. 自動附上法規來源摘錄回傳給使用者
+2. **先做信心把關**(2026/09新增):檢索最相關文件的距離太大代表這4部法規裡可能沒有相關內容,直接誠實回報,不進入下一步
+3. 用 LangChain 在向量資料庫(`chroma_db_langchain`)中檢索相關法規內容
+4. 透過 OpenAI GPT 產生法規說明回答
+5. 自動附上法規來源摘錄回傳給使用者
+
+> **注意**:這個正式上線的 Bot 走的是 `OpenAI text-embedding-3-small` + `Chroma` 這條線,跟下面「檢索品質評估」「LoRA」「資料量門檻」幾個章節驗證的**本地 sentence-transformers + FAISS** 是完全不同的兩套embedding/資料庫,彼此獨立、沒有互相取代。下面幾個研究章節的結論(不要對小語料做全參數微調、LoRA能緩解災難性遺忘)是通用的機器學習原則,不是直接套用到這個正式環境的改動——這個正式環境目前唯一實際接上的研究成果是下面的信心把關機制,是**針對這個Chroma DB本身**重新校準的,不是搬用sentence-transformers那邊算出來的閾值(兩者分數尺度、距離定義都不同)。
 
 ## 檔案說明
 
@@ -34,6 +37,19 @@ pip install -r requirements.txt
 python setup_database.py   # 建立向量資料庫
 python app_langchain.py    # 啟動服務
 ```
+
+## LINE Bot 信心把關(2026/09 新增)
+
+原本的 Bot 不管檢索到的內容夠不夠相關,一律把 top-5 結果塞給 GPT 生成回答——如果使用者問的問題根本不在這4部法規範圍內,GPT 還是會努力「掰」出一個看似合理的回答。`eval/calibrate_bot_confidence.py` 比照 food-rag 的做法,用24題真實問題(跟這個 Chroma DB 同一批4部法規PDF建的,問題文字可以直接重用)+ 6題明顯無關的問題,實測 `similarity_search_with_score()` 回傳的距離分布:
+
+| | 距離範圍(L2距離,越小越相關) |
+|---|---|
+| In-domain(24題) | 0.502 ~ 1.119 |
+| Out-of-domain(6題) | 1.224 ~ 1.726 |
+
+兩組有清楚間隔(gap=0.104,比food-rag reranker分數的間隔窄很多,但仍然是乾淨分開的),取中點訂閾值為 **1.1714**。`app_langchain.py` 現在會先查一次 top-1 距離,超過閾值就直接誠實回報「沒有找到足夠可信的相關內容」,不呼叫 GPT。
+
+**誠實的範圍說明**:這個閾值是針對這個 Chroma DB(OpenAI embedding)校準的,跟下面幾個章節驗證 LoRA/TSDAE 用的本地 sentence-transformers embedding 是兩套不同的分數系統,不能互相套用——這是刻意保持範圍小、可控的改動(只加信心把關,不換 embedding 模型或資料庫),兩條線目前是獨立的。
 
 ## 檢索品質評估(2026/09 新增)
 
